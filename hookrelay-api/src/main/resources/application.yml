@@ -1,0 +1,48 @@
+spring:
+  application:
+    name: hookrelay-api
+
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${POSTGRES_PORT:5432}/${POSTGRES_DB:hookrelay}
+    username: ${POSTGRES_USER:hookrelay}
+    password: ${POSTGRES_PASSWORD:hookrelay}
+
+  jpa:
+    # Explicitly false: TenantScopingFilter binds its own request-scoped
+    # EntityManager so it can enable the tenant Hibernate filter on it. Two
+    # session-binding mechanisms fighting over the same request would be
+    # confusing at best.
+    open-in-view: false
+    hibernate:
+      # Flyway owns schema evolution; Hibernate must never auto-generate DDL.
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc.time_zone: UTC
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:29092}
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+
+server:
+  port: 8081
+
+hookrelay:
+  security:
+    jwt:
+      secret: ${HOOKRELAY_JWT_SECRET:change-me-to-a-random-64-byte-base64-secret}
+      ttl-seconds: 3600
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus

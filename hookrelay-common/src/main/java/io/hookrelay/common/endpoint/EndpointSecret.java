@@ -1,0 +1,94 @@
+package io.hookrelay.common.endpoint;
+
+import io.hookrelay.common.tenant.Tenant;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
+import jakarta.persistence.FetchType;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.Id;
+import jakarta.persistence.JoinColumn;
+import jakarta.persistence.ManyToOne;
+import jakarta.persistence.Table;
+import java.time.Instant;
+import java.util.UUID;
+import org.hibernate.annotations.Filter;
+import org.hibernate.annotations.UuidGenerator;
+
+/**
+ * A signing secret for an endpoint. Multiple rows can exist per endpoint —
+ * during rotation one is ACTIVE and one is ROTATING, and the dispatcher signs
+ * with every non-RETIRED secret (see Phase 4) so receivers can move to the
+ * new key on their own schedule. Uniqueness of "at most one ACTIVE / one
+ * ROTATING per endpoint" is enforced by {@code EndpointSecretService}, not a
+ * DB constraint, so RETIRED history can accumulate freely.
+ */
+@Entity
+@Table(name = "endpoint_secret")
+@Filter(name = "tenantFilter", condition = "tenant_id = :tenantId")
+public class EndpointSecret {
+
+    @Id
+    @GeneratedValue
+    @UuidGenerator
+    @Column(name = "id")
+    private UUID id;
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(name = "endpoint_id", nullable = false, updatable = false)
+    private Endpoint endpoint;
+
+    @ManyToOne(fetch = FetchType.LAZY, optional = false)
+    @JoinColumn(name = "tenant_id", nullable = false, updatable = false)
+    private Tenant tenant;
+
+    @Column(name = "secret_hash", nullable = false, updatable = false)
+    private String secretHash;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "status", nullable = false)
+    private SecretStatus status = SecretStatus.ACTIVE;
+
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private Instant createdAt;
+
+    protected EndpointSecret() {
+        // JPA
+    }
+
+    public EndpointSecret(Endpoint endpoint, String secretHash) {
+        this.endpoint = endpoint;
+        this.tenant = endpoint.getTenant();
+        this.secretHash = secretHash;
+        this.createdAt = Instant.now();
+    }
+
+    public UUID getId() {
+        return id;
+    }
+
+    public Endpoint getEndpoint() {
+        return endpoint;
+    }
+
+    public Tenant getTenant() {
+        return tenant;
+    }
+
+    public String getSecretHash() {
+        return secretHash;
+    }
+
+    public SecretStatus getStatus() {
+        return status;
+    }
+
+    public void setStatus(SecretStatus status) {
+        this.status = status;
+    }
+
+    public Instant getCreatedAt() {
+        return createdAt;
+    }
+}
