@@ -26,6 +26,15 @@ spring:
 
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:29092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        # Durability over throughput: this topic is the "wake up and try this
+        # delivery" signal, and it's cheap to send, so there's no reason to
+        # trade acks for latency here.
+        acks: all
+        spring.json.add.type.headers: false
 
   data:
     redis:

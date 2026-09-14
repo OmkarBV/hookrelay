@@ -1,5 +1,6 @@
 package io.hookrelay.api.security;
 
+import io.hookrelay.api.ingestion.PayloadSizeLimitFilter;
 import io.hookrelay.api.security.apikey.ApiKeyAuthenticationFilter;
 import io.hookrelay.api.security.apikey.ApiKeyService;
 import io.hookrelay.api.security.jwt.JwtAuthenticationFilter;
@@ -29,6 +30,13 @@ import org.springframework.security.web.authentication.UsernamePasswordAuthentic
 @EnableMethodSecurity
 public class SecurityConfig {
 
+    // Coarse DoS guard on the whole request body, well above the 256KB
+    // business-rule limit on the payload field itself (enforced precisely in
+    // EventIngestionService) to leave room for eventType/eventId/JSON
+    // structure overhead. Runs before authentication so an oversized body
+    // never reaches API-key hashing/lookup.
+    private static final long MAX_INGESTION_BODY_BYTES = 512 * 1024;
+
     @Bean
     public PasswordEncoder passwordEncoder() {
         return new BCryptPasswordEncoder();
@@ -43,7 +51,8 @@ public class SecurityConfig {
                 .csrf(AbstractHttpConfigurer::disable)
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(auth -> auth.anyRequest().authenticated())
-                .addFilterBefore(new ApiKeyAuthenticationFilter(apiKeyService), UsernamePasswordAuthenticationFilter.class)
+                .addFilterBefore(new PayloadSizeLimitFilter(MAX_INGESTION_BODY_BYTES), UsernamePasswordAuthenticationFilter.class)
+                .addFilterAfter(new ApiKeyAuthenticationFilter(apiKeyService), PayloadSizeLimitFilter.class)
                 .addFilterAfter(new TenantScopingFilter(entityManagerFactory), ApiKeyAuthenticationFilter.class);
         return http.build();
     }

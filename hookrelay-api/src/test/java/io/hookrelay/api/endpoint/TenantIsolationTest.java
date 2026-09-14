@@ -50,6 +50,13 @@ class TenantIsolationTest {
         registry.add("spring.datasource.username", POSTGRES::getUsername);
         registry.add("spring.datasource.password", POSTGRES::getPassword);
         registry.add("hookrelay.security.jwt.secret", () -> "test-secret-test-secret-test-secret-test-secret");
+        // This test doesn't exercise Kafka at all; without a broker, the
+        // default admin-client timeouts would otherwise add ~80s of context
+        // startup just to fail creating webhook.deliveries.
+        registry.add("spring.kafka.admin.properties.request.timeout.ms", () -> "500");
+        registry.add("spring.kafka.admin.properties.default.api.timeout.ms", () -> "1000");
+        registry.add("spring.kafka.admin.properties.retries", () -> "0");
+        registry.add("spring.kafka.admin.fail-fast", () -> "false");
     }
 
     @Autowired
