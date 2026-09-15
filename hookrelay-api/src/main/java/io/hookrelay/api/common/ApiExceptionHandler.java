@@ -2,6 +2,7 @@ package io.hookrelay.api.common;
 
 import io.hookrelay.api.endpoint.EndpointNotFoundException;
 import io.hookrelay.api.ingestion.PayloadTooLargeException;
+import io.hookrelay.common.security.SsrfViolationException;
 import java.time.Instant;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -23,6 +24,11 @@ public class ApiExceptionHandler {
     @ExceptionHandler(EndpointNotFoundException.class)
     public ResponseEntity<ErrorResponse> handleNotFound(EndpointNotFoundException e) {
         return ResponseEntity.status(HttpStatus.NOT_FOUND).body(ErrorResponse.of(HttpStatus.NOT_FOUND, e.getMessage()));
+    }
+
+    @ExceptionHandler(SsrfViolationException.class)
+    public ResponseEntity<ErrorResponse> handleSsrfViolation(SsrfViolationException e) {
+        return ResponseEntity.badRequest().body(ErrorResponse.of(HttpStatus.BAD_REQUEST, e.getMessage()));
     }
 
     @ExceptionHandler(IllegalArgumentException.class)

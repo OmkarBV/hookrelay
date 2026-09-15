@@ -43,8 +43,12 @@ public class EndpointSecret {
     @JoinColumn(name = "tenant_id", nullable = false, updatable = false)
     private Tenant tenant;
 
-    @Column(name = "secret_hash", nullable = false, updatable = false)
-    private String secretHash;
+    // Encrypted (AES-256-GCM, see SecretEncryptionService), not hashed — the
+    // dispatcher must recover the actual secret to sign with it. See the V4
+    // migration for why this differs from api_key/admin_user's hash-only
+    // storage.
+    @Column(name = "secret_ciphertext", nullable = false, updatable = false)
+    private String secretCiphertext;
 
     @Enumerated(EnumType.STRING)
     @Column(name = "status", nullable = false)
@@ -57,10 +61,10 @@ public class EndpointSecret {
         // JPA
     }
 
-    public EndpointSecret(Endpoint endpoint, String secretHash) {
+    public EndpointSecret(Endpoint endpoint, String secretCiphertext) {
         this.endpoint = endpoint;
         this.tenant = endpoint.getTenant();
-        this.secretHash = secretHash;
+        this.secretCiphertext = secretCiphertext;
         this.createdAt = Instant.now();
     }
 
@@ -76,8 +80,8 @@ public class EndpointSecret {
         return tenant;
     }
 
-    public String getSecretHash() {
-        return secretHash;
+    public String getSecretCiphertext() {
+        return secretCiphertext;
     }
 
     public SecretStatus getStatus() {

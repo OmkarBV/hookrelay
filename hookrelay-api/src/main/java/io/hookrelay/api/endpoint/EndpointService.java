@@ -2,8 +2,13 @@ package io.hookrelay.api.endpoint;
 
 import io.hookrelay.common.application.Application;
 import io.hookrelay.common.application.ApplicationRepository;
+import io.hookrelay.common.crypto.SecretEncryptionService;
 import io.hookrelay.common.endpoint.Endpoint;
 import io.hookrelay.common.endpoint.EndpointRepository;
+import io.hookrelay.common.endpoint.EndpointSecret;
+import io.hookrelay.common.endpoint.EndpointSecretRepository;
+import io.hookrelay.common.security.EndpointUrlValidator;
+import java.net.UnknownHostException;
 import java.util.List;
 import java.util.UUID;
 import org.springframework.stereotype.Service;
@@ -21,19 +26,47 @@ public class EndpointService {
 
     private final EndpointRepository endpointRepository;
     private final ApplicationRepository applicationRepository;
+    private final EndpointSecretRepository endpointSecretRepository;
+    private final SecretEncryptionService secretEncryptionService;
+    private final EndpointUrlValidator endpointUrlValidator;
 
-    public EndpointService(EndpointRepository endpointRepository, ApplicationRepository applicationRepository) {
+    public EndpointService(
+            EndpointRepository endpointRepository,
+            ApplicationRepository applicationRepository,
+            EndpointSecretRepository endpointSecretRepository,
+            SecretEncryptionService secretEncryptionService,
+            EndpointUrlValidator endpointUrlValidator) {
         this.endpointRepository = endpointRepository;
         this.applicationRepository = applicationRepository;
+        this.endpointSecretRepository = endpointSecretRepository;
+        this.secretEncryptionService = secretEncryptionService;
+        this.endpointUrlValidator = endpointUrlValidator;
+    }
+
+    public record CreateResult(Endpoint endpoint, String rawSecret) {
     }
 
     @Transactional
-    public Endpoint create(UUID applicationId, String url, String description, List<String> eventTypes) {
+    public CreateResult create(UUID applicationId, String url, String description, List<String> eventTypes) {
+        try {
+            endpointUrlValidator.validate(url);
+        } catch (UnknownHostException e) {
+            throw new IllegalArgumentException("Cannot resolve endpoint host: " + url);
+        }
+
         Application application = applicationRepository.findById(applicationId)
                 .orElseThrow(() -> new IllegalArgumentException("Application not found: " + applicationId));
         Endpoint endpoint = new Endpoint(application, url, description);
         eventTypes.forEach(endpoint::subscribeTo);
-        return endpointRepository.save(endpoint);
+        endpoint = endpointRepository.save(endpoint);
+
+        // An endpoint with no signing secret can never have a delivery
+        // signed, so one is provisioned immediately rather than requiring a
+        // separate setup step. Shown once in the response, like an API key.
+        String rawSecret = EndpointSecretGenerator.generate();
+        endpointSecretRepository.save(new EndpointSecret(endpoint, secretEncryptionService.encrypt(rawSecret)));
+
+        return new CreateResult(endpoint, rawSecret);
     }
 
     @Transactional(readOnly = true)

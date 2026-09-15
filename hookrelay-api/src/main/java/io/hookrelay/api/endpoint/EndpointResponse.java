@@ -13,9 +13,11 @@ public record EndpointResponse(
         String description,
         EndpointStatus status,
         Set<String> eventTypes,
-        Instant createdAt) {
+        Instant createdAt,
+        String secret) {
 
-    public static EndpointResponse from(Endpoint endpoint) {
+    /** {@code secret} is non-null only on the create response — shown once, never again. */
+    public static EndpointResponse from(Endpoint endpoint, String rawSecret) {
         return new EndpointResponse(
                 endpoint.getId(),
                 endpoint.getApplication().getId(),
@@ -23,6 +25,11 @@ public record EndpointResponse(
                 endpoint.getDescription(),
                 endpoint.getStatus(),
                 endpoint.getSubscribedEventTypes(),
-                endpoint.getCreatedAt());
+                endpoint.getCreatedAt(),
+                rawSecret);
+    }
+
+    public static EndpointResponse from(Endpoint endpoint) {
+        return from(endpoint, null);
     }
 }

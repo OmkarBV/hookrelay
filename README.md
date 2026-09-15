@@ -11,18 +11,26 @@ signing, retries, per-endpoint isolation, delivery logging, and replay.
 ## Modules
 
 ```
-hookrelay-common/        shared JPA entities, repositories, Kafka message contracts
-hookrelay-api/           ingestion + admin REST API (Phases 1-3 so far)
-hookrelay-dispatcher/    Kafka consumer, HTTP delivery (not yet built)
+hookrelay-common/        shared JPA entities, repositories, Kafka message contracts, Flyway migrations
+hookrelay-api/           ingestion + admin REST API (Phases 1-3)
+hookrelay-dispatcher/    Kafka consumer, HTTP delivery, signing (Phase 4)
 hookrelay-testreceiver/  chaos receiver for tests (not yet built)
 ```
+
+Flyway migrations live under `hookrelay-common/src/main/resources/db/migration`
+even though only `hookrelay-api` ever executes them
+(`spring.flyway.enabled=false` in the dispatcher) — both modules need the
+same schema knowledge (JPA entity mappings must match it), and dispatcher's
+own tests need a real schema to run against, so the SQL files live
+somewhere both classpaths reach rather than being duplicated.
 
 ## Quick start
 
 ```
 docker compose up -d
-./mvnw -pl hookrelay-common,hookrelay-api install -DskipTests
+./mvnw -pl hookrelay-common,hookrelay-api,hookrelay-dispatcher install -DskipTests
 HOOKRELAY_JWT_SECRET=$(openssl rand -base64 64) ./mvnw -pl hookrelay-api spring-boot:run
+./mvnw -pl hookrelay-dispatcher spring-boot:run   # separate deployable, separate terminal
 ```
 
 The API listens on `:8081`. Bootstrap the first tenant (works exactly once):
@@ -107,8 +115,73 @@ back the original event's id in a fresh transaction (Postgres aborts the
 rest of a transaction after a constraint violation, so the lookup can't
 share the transaction that failed).
 
+### Endpoint secrets are encrypted, not hashed — a correction to the Phase 1 schema
+
+The original schema stored `endpoint_secret.secret_hash`, mirroring the
+api_key/admin_user pattern of storing only a one-way hash. That's wrong for
+this specific secret: a hash can only ever be *compared against*, never
+recovered, but HMAC-signing every delivery requires the dispatcher to
+reproduce the actual secret bytes on every single request. A migration
+(V4) renames the column to `secret_ciphertext` and widens it; the value is
+now AES-256-GCM encrypted (`SecretEncryptionService`, shared by both
+modules) rather than hashed, so it's recoverable with the server's key but
+still not sitting in the database in plaintext.
+
+### SSRF protection is a Spring bean, not a static check, so it can be tested honestly
+
+`EndpointUrlValidator` resolves DNS and rejects private/loopback/link-local
+addresses (including the `169.254.169.254` cloud metadata endpoint) — and
+does so **at delivery time**, not only at endpoint registration, since DNS
+can be re-pointed to an internal address at any point after an endpoint was
+first validated. It's a Spring-managed component with a
+`hookrelay.security.ssrf-protection.enabled` flag (default `true`
+everywhere) specifically so integration tests can point deliveries at an
+in-process WireMock/Testcontainers server — which is otherwise
+indistinguishable from the loopback address this class exists to block —
+without weakening the check any real request path uses. Production
+configuration never sets it to `false`.
+
+### Virtual threads, and why ordering still holds
+
+The dispatcher runs on `spring.threads.virtual.enabled=true`: this workload
+is almost entirely blocked-on-network-IO (HTTP deliveries, DB, Kafka), which
+is exactly what virtual threads are for — a fixed platform-thread pool would
+force a choice between a small pool (one slow receiver stalls everything
+queued behind it) and a large one (mostly idle threads burning ~1MB of stack
+each). One pinning pitfall is worth calling out explicitly: a virtual thread
+stays pinned to its carrier for the duration of any `synchronized` block it
+executes, so blocking IO inside one defeats the purpose entirely. Nothing on
+the delivery path uses `synchronized` — the global semaphore and the
+per-endpoint Resilience4j bulkhead are both `java.util.concurrent`
+primitives for exactly this reason.
+
+Per-endpoint ordering (delivery for one endpoint arrives in order) comes
+from Kafka partitioning by `endpointId` *combined with* each partition being
+consumed strictly sequentially — the dispatcher does the blocking HTTP call
+directly on the listener thread rather than fanning it out, so "next
+message" only gets polled once the current one is fully attempted and
+recorded. The per-endpoint bulkhead still matters despite that: different
+endpoints can hash to the same partition (accepted head-of-line blocking,
+the trade-off of key-based partitioning), and a retried delivery can be
+picked up by a different partition-worker or dispatcher instance later — the
+bulkhead is what caps concurrent attempts at one endpoint across those
+cases, not within a single partition's normal flow.
+
+### Why 4xx (except 429) is terminal, not retried
+
+A 4xx means the receiver looked at this exact request and rejected it —
+retrying the identical request gets the identical rejection every time, so
+retrying it is pure waste until the customer fixes whatever caused the
+rejection (at which point Replay, not blind retry, is the recovery path).
+`429` is the one exception: it's an explicit "try again, just not right
+now" from the receiver, not a rejection of the request itself. 5xx and
+network errors (timeout, connection refused, DNS failure) are the receiver
+or network failing independently of what was sent — exactly the transient
+condition retries exist for.
+
 ## What's built so far
 
 - **Phase 1** — multi-module layout, Docker Compose (Postgres/Kafka-KRaft/Redis), Flyway schema
 - **Phase 2** — API-key (ingestion) and JWT (admin) auth, role/permission model, tenant isolation
 - **Phase 3** — `POST /api/v1/events`: validation, idempotency, fan-out, transactional outbox publish to Kafka
+- **Phase 4** — dispatcher: Stripe/Svix-style HMAC signing with secret rotation, SSRF-safe delivery on virtual threads, bounded global + per-endpoint concurrency, attempt recording, basic (Phase-5-to-be-refined) backoff scheduling

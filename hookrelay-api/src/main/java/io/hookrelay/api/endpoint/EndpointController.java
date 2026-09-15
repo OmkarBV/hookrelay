@@ -25,10 +25,10 @@ public class EndpointController {
     @PostMapping
     @PreAuthorize("hasAuthority('ENDPOINT_CREATE')")
     public ResponseEntity<EndpointResponse> create(@Valid @RequestBody CreateEndpointRequest request) {
-        var endpoint = endpointService.create(
+        var result = endpointService.create(
                 request.applicationId(), request.url(), request.description(), request.eventTypes());
-        return ResponseEntity.created(URI.create("/api/v1/admin/endpoints/" + endpoint.getId()))
-                .body(EndpointResponse.from(endpoint));
+        return ResponseEntity.created(URI.create("/api/v1/admin/endpoints/" + result.endpoint().getId()))
+                .body(EndpointResponse.from(result.endpoint(), result.rawSecret()));
     }
 
     @GetMapping("/{id}")

@@ -5,13 +5,15 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.autoconfigure.domain.EntityScan;
 import org.springframework.boot.autoconfigure.security.servlet.UserDetailsServiceAutoConfiguration;
+import org.springframework.context.annotation.ComponentScan;
 import org.springframework.data.jpa.repository.config.EnableJpaRepositories;
 
 /**
- * Entities and Spring Data repositories live in hookrelay-common
- * (io.hookrelay.common), a sibling package to this application
- * (io.hookrelay.api) rather than a sub-package, so they fall outside Spring
- * Boot's default component scan and must be wired in explicitly.
+ * Entities, Spring Data repositories, and shared components (e.g.
+ * SecretEncryptionService) live in hookrelay-common (io.hookrelay.common), a
+ * sibling package to this application (io.hookrelay.api) rather than a
+ * sub-package, so they fall outside Spring Boot's default component scan and
+ * must be wired in explicitly.
  *
  * <p>repositoryBaseClass swaps every repository's default implementation for
  * {@link TenantScopedRepositoryImpl}, which fixes findById/existsById to
@@ -24,6 +26,7 @@ import org.springframework.data.jpa.repository.config.EnableJpaRepositories;
  * user and a misleading startup log line.
  */
 @SpringBootApplication(exclude = UserDetailsServiceAutoConfiguration.class)
+@ComponentScan({"io.hookrelay.api", "io.hookrelay.common"})
 @EntityScan("io.hookrelay.common")
 @EnableJpaRepositories(value = "io.hookrelay.common", repositoryBaseClass = TenantScopedRepositoryImpl.class)
 public class HookrelayApiApplication {

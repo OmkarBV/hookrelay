@@ -1,0 +1,75 @@
+spring:
+  application:
+    name: hookrelay-dispatcher
+
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${POSTGRES_PORT:5432}/${POSTGRES_DB:hookrelay}
+    username: ${POSTGRES_USER:hookrelay}
+    password: ${POSTGRES_PASSWORD:hookrelay}
+
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc.time_zone: UTC
+
+  # hookrelay-api owns schema migrations; running Flyway from a second
+  # deployable against the same database is redundant at best and a race at
+  # worst if both start up at once.
+  flyway:
+    enabled: false
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:29092}
+    consumer:
+      group-id: hookrelay-dispatcher
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: io.hookrelay.common.delivery
+        spring.json.value.default.type: io.hookrelay.common.delivery.DeliveryTaskMessage
+    listener:
+      # One consumer thread per partition: partitioning by endpointId only
+      # gives per-endpoint ordering if each partition is consumed
+      # sequentially by a single thread (see DeliveryTaskListener).
+      concurrency: 6
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+
+  # This service is almost entirely blocked-on-network-IO (HTTP deliveries,
+  # DB, Kafka), which is exactly the workload virtual threads exist for —
+  # see DeliveryExecutionService's Javadoc for the full reasoning. This one
+  # flag switches Spring's built-in executors (including the Kafka listener
+  # container's) to virtual threads.
+  threads:
+    virtual:
+      enabled: true
+
+server:
+  port: 8082
+
+hookrelay:
+  security:
+    secret-encryption-key: ${HOOKRELAY_SECRET_ENCRYPTION_KEY:2P0OfgmRP7wHAAILerwZoJCC92TIw0RjZ4l0kXhIT/k=}
+  dispatcher:
+    # Hard cap on total concurrent in-flight HTTP deliveries across every
+    # endpoint. Virtual threads are cheap; sockets, memory, and the
+    # receiving servers on the other end are not.
+    max-inflight: ${HOOKRELAY_DISPATCHER_MAX_INFLIGHT:500}
+    # Per-endpoint concurrency cap so retries or multiple dispatcher
+    # instances can't pile more than this many simultaneous attempts onto
+    # one customer's endpoint.
+    per-endpoint-max-concurrent: 5
+    default-timeout-ms: 10000
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus

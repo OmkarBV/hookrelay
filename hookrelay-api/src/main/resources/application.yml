@@ -49,6 +49,10 @@ hookrelay:
     jwt:
       secret: ${HOOKRELAY_JWT_SECRET:change-me-to-a-random-64-byte-base64-secret}
       ttl-seconds: 3600
+    # Dev-only default (generated with `openssl rand -base64 32`). Any real
+    # deployment must override this — it decrypts every endpoint signing
+    # secret in the database.
+    secret-encryption-key: ${HOOKRELAY_SECRET_ENCRYPTION_KEY:2P0OfgmRP7wHAAILerwZoJCC92TIw0RjZ4l0kXhIT/k=}
 
 management:
   endpoints:
