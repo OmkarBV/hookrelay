@@ -19,7 +19,9 @@ import java.util.HashSet;
 import java.util.Set;
 import java.util.UUID;
 import org.hibernate.annotations.Filter;
+import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.annotations.UuidGenerator;
+import org.hibernate.type.SqlTypes;
 
 /** A customer's webhook receiving URL. */
 @Entity
@@ -59,6 +61,18 @@ public class Endpoint {
 
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
+
+    /** Null means "use the default schedule" — see RetryBackoff in hookrelay-dispatcher. */
+    @JdbcTypeCode(SqlTypes.ARRAY)
+    @Column(name = "retry_schedule_seconds")
+    private Integer[] retryScheduleSeconds;
+
+    /** Set only when the circuit breaker auto-pauses this endpoint; null for a manual pause. */
+    @Column(name = "paused_reason")
+    private String pausedReason;
+
+    @Column(name = "paused_at")
+    private Instant pausedAt;
 
     @ElementCollection(fetch = FetchType.EAGER)
     @CollectionTable(name = "endpoint_subscription", joinColumns = @JoinColumn(name = "endpoint_id"))
@@ -131,5 +145,27 @@ public class Endpoint {
 
     public Set<String> getSubscribedEventTypes() {
         return subscribedEventTypes;
+    }
+
+    public Integer[] getRetryScheduleSeconds() {
+        return retryScheduleSeconds;
+    }
+
+    public void setRetryScheduleSeconds(Integer[] retryScheduleSeconds) {
+        this.retryScheduleSeconds = retryScheduleSeconds;
+    }
+
+    public String getPausedReason() {
+        return pausedReason;
+    }
+
+    public Instant getPausedAt() {
+        return pausedAt;
+    }
+
+    public void pause(String reason) {
+        this.status = EndpointStatus.PAUSED;
+        this.pausedReason = reason;
+        this.pausedAt = Instant.now();
     }
 }

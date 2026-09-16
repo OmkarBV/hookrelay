@@ -82,6 +82,15 @@ class DeliveryExecutionServiceTest {
         registry.add("spring.flyway.locations", () -> "classpath:db/migration");
         registry.add("hookrelay.security.secret-encryption-key", () -> "2P0OfgmRP7wHAAILerwZoJCC92TIw0RjZ4l0kXhIT/k=");
         registry.add("spring.kafka.listener.auto-startup", () -> "false");
+        registry.add("spring.kafka.admin.properties.request.timeout.ms", () -> "500");
+        registry.add("spring.kafka.admin.properties.default.api.timeout.ms", () -> "1000");
+        registry.add("spring.kafka.admin.properties.retries", () -> "0");
+        registry.add("spring.kafka.admin.fail-fast", () -> "false");
+        // This test drives DeliveryExecutionService.execute() directly; the
+        // @Scheduled retry sweeper and partition-maintenance job have
+        // nothing to do here and would otherwise keep firing against this
+        // test's Postgres container after it's torn down.
+        registry.add("hookrelay.dispatcher.scheduling.enabled", () -> "false");
         // WireMock only ever runs on loopback, which EndpointUrlValidator
         // correctly blocks in production. See its Javadoc for why this
         // override exists and why it's never set outside tests.

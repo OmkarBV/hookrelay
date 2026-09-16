@@ -3,6 +3,7 @@ package io.hookrelay.dispatcher.delivery;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.resilience4j.bulkhead.Bulkhead;
 import io.github.resilience4j.bulkhead.BulkheadRegistry;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.hookrelay.common.crypto.SecretEncryptionService;
 import io.hookrelay.common.delivery.Delivery;
 import io.hookrelay.common.delivery.DeliveryAttempt;
@@ -60,6 +61,7 @@ public class DeliveryExecutionService {
     private final DeliveryOutcomeRecorder outcomeRecorder;
     private final ObjectMapper objectMapper;
     private final EndpointUrlValidator endpointUrlValidator;
+    private final EndpointCircuitBreakers circuitBreakers;
 
     public DeliveryExecutionService(
             DeliveryRepository deliveryRepository,
@@ -71,7 +73,8 @@ public class DeliveryExecutionService {
             BulkheadRegistry bulkheadRegistry,
             DeliveryOutcomeRecorder outcomeRecorder,
             ObjectMapper objectMapper,
-            EndpointUrlValidator endpointUrlValidator) {
+            EndpointUrlValidator endpointUrlValidator,
+            EndpointCircuitBreakers circuitBreakers) {
         this.deliveryRepository = deliveryRepository;
         this.endpointSecretRepository = endpointSecretRepository;
         this.secretEncryptionService = secretEncryptionService;
@@ -82,13 +85,17 @@ public class DeliveryExecutionService {
         this.outcomeRecorder = outcomeRecorder;
         this.objectMapper = objectMapper;
         this.endpointUrlValidator = endpointUrlValidator;
+        this.circuitBreakers = circuitBreakers;
     }
 
     public void execute(UUID deliveryId) {
         Delivery delivery = deliveryRepository.findByIdWithEndpointAndEvent(deliveryId).orElse(null);
         if (delivery == null) {
-            log.warn("Delivery {} not found; skipping (endpoint or event may have been deleted)", deliveryId);
-            return;
+            // Not "log and move on": at-least-once redelivery means this
+            // exact message could arrive again unchanged, and it will never
+            // succeed — that's exactly what the dead-letter topic is for.
+            throw new UnprocessableDeliveryTaskException(
+                    "Delivery " + deliveryId + " not found; endpoint or event was likely deleted");
         }
         // At-least-once Kafka delivery means this task can arrive more than
         // once; a delivery already in a terminal state is a no-op, not an
@@ -103,12 +110,23 @@ public class DeliveryExecutionService {
             return;
         }
 
+        CircuitBreaker circuitBreaker = circuitBreakers.forEndpoint(endpoint.getId());
+        if (!circuitBreaker.tryAcquirePermission()) {
+            // Don't waste a semaphore/bulkhead slot on an endpoint the
+            // circuit breaker has already decided is currently broken.
+            recordAndTransition(delivery, null, null, null, "CIRCUIT_OPEN", true,
+                    "Circuit breaker open for this endpoint");
+            return;
+        }
+
         try {
             endpointUrlValidator.validate(endpoint.getUrl());
         } catch (SsrfViolationException e) {
+            circuitBreaker.releasePermission();
             recordAndTransition(delivery, null, null, null, "SSRF_BLOCKED", false, e.getMessage());
             return;
         } catch (UnknownHostException e) {
+            circuitBreaker.releasePermission();
             recordAndTransition(delivery, null, null, null, "DNS_ERROR", true, e.getMessage());
             return;
         }
@@ -118,6 +136,7 @@ public class DeliveryExecutionService {
                 .map(secretEncryptionService::decrypt)
                 .toList();
         if (signingSecrets.isEmpty()) {
+            circuitBreaker.releasePermission();
             recordAndTransition(delivery, null, null, null, "NO_SIGNING_SECRET", false,
                     "Endpoint has no active signing secret");
             return;
@@ -129,19 +148,22 @@ public class DeliveryExecutionService {
         try {
             semaphoreAcquired = inFlightDeliverySemaphore.tryAcquire(30, TimeUnit.SECONDS);
             if (!semaphoreAcquired) {
+                circuitBreaker.releasePermission();
                 recordAndTransition(delivery, null, null, null, "CAPACITY_EXCEEDED", true,
                         "Global in-flight delivery limit reached");
                 return;
             }
             bulkheadAcquired = bulkhead.tryAcquirePermission();
             if (!bulkheadAcquired) {
+                circuitBreaker.releasePermission();
                 recordAndTransition(delivery, null, null, null, "ENDPOINT_CAPACITY_EXCEEDED", true,
                         "Per-endpoint concurrency limit reached");
                 return;
             }
 
-            attemptDelivery(delivery, endpoint, signingSecrets);
+            attemptDelivery(delivery, endpoint, signingSecrets, circuitBreaker);
         } catch (InterruptedException e) {
+            circuitBreaker.releasePermission();
             Thread.currentThread().interrupt();
         } finally {
             if (bulkheadAcquired) {
@@ -153,7 +175,8 @@ public class DeliveryExecutionService {
         }
     }
 
-    private void attemptDelivery(Delivery delivery, Endpoint endpoint, List<String> signingSecrets) {
+    private void attemptDelivery(
+            Delivery delivery, Endpoint endpoint, List<String> signingSecrets, CircuitBreaker circuitBreaker) {
         String rawBody = delivery.getEvent().getPayload();
         long timestamp = Instant.now().getEpochSecond();
 
@@ -162,10 +185,13 @@ public class DeliveryExecutionService {
         headers.put("Hookrelay-Timestamp", Long.toString(timestamp));
         headers.put("Hookrelay-Signature", signatureService.buildSignatureHeader(rawBody, timestamp, signingSecrets));
 
+        long start = System.nanoTime();
         DeliveryHttpResult result = httpDeliveryClient.send(endpoint.getUrl(), headers, rawBody, endpoint.getTimeoutMs());
+        long elapsedNanos = System.nanoTime() - start;
         String requestHeadersJson = writeHeadersJson(headers);
 
         if (result.isNetworkError()) {
+            circuitBreaker.onError(elapsedNanos, TimeUnit.NANOSECONDS, new DeliveryFailedException(result.errorType()));
             recordAndTransition(delivery, requestHeadersJson, null, result.latencyMs(), result.errorType(), true,
                     "Network error: " + result.errorType());
             return;
@@ -173,6 +199,7 @@ public class DeliveryExecutionService {
 
         int status = result.statusCode();
         if (status >= 200 && status < 300) {
+            circuitBreaker.onSuccess(elapsedNanos, TimeUnit.NANOSECONDS);
             recordSuccess(delivery, requestHeadersJson, result);
             return;
         }
@@ -186,9 +213,21 @@ public class DeliveryExecutionService {
         // 6), not blind retry. 5xx and network errors are the receiver (or
         // the network) failing independently of what we sent, which is
         // exactly the transient condition retries are meant to recover from.
+        // Either way, from the circuit breaker's perspective this endpoint
+        // just failed a call — a run of 4xx (e.g. a rotated API key on their
+        // end) is just as good evidence of a broken integration as a run of
+        // 5xx, even though each individual 4xx delivery itself won't retry.
+        circuitBreaker.onError(elapsedNanos, TimeUnit.NANOSECONDS, new DeliveryFailedException("HTTP " + status));
         boolean retryable = status == 429 || status >= 500;
         recordAndTransition(delivery, requestHeadersJson, status, result.latencyMs(),
                 retryable ? "SERVER_ERROR" : "CLIENT_ERROR", retryable, "HTTP " + status);
+    }
+
+    /** Marker passed to Resilience4j's onError so its event log shows a meaningful cause. */
+    private static final class DeliveryFailedException extends RuntimeException {
+        DeliveryFailedException(String reason) {
+            super(reason, null, false, false);
+        }
     }
 
     private void recordSuccess(Delivery delivery, String requestHeadersJson, DeliveryHttpResult result) {
@@ -226,7 +265,7 @@ public class DeliveryExecutionService {
             delivery.setStatus(DeliveryStatus.EXHAUSTED);
             delivery.setCompletedAt(Instant.now());
         } else {
-            RetryBackoff.nextAttemptAt(attemptNumber).ifPresentOrElse(
+            RetryBackoff.nextAttemptAt(attemptNumber, delivery.getEndpoint().getRetryScheduleSeconds()).ifPresentOrElse(
                     nextAttemptAt -> {
                         delivery.setStatus(DeliveryStatus.FAILED);
                         delivery.setNextAttemptAt(nextAttemptAt);

@@ -84,12 +84,13 @@ pointing at a delivery row that was never actually persisted.
 
 There's no separate `outbox` table because the `delivery` row already plays
 that role: it's written durably before any publish is attempted, and it
-carries a `status`/`next_attempt_at` that a Phase 5 retry sweeper can poll
-for anything published-but-never-confirmed just as naturally as it polls for
-retries. The one risk this doesn't cover — the process crashing between
-commit and the (fire-and-forget) Kafka publish — is accepted deliberately:
-waiting on the Kafka ack before returning would trade ingestion latency for
-a failure mode the sweeper already has to handle anyway.
+carries a `status`/`next_attempt_at` that the retry sweeper (`RetrySweeper`,
+Phase 5) polls for anything published-but-never-confirmed just as naturally
+as it polls for genuine retries. The one risk this doesn't cover — the
+process crashing between commit and the (fire-and-forget) Kafka publish —
+is accepted deliberately: waiting on the Kafka ack before returning would
+trade ingestion latency for a failure mode the sweeper already has to
+handle anyway.
 
 ### Kafka partition key: `endpointId`, not `eventId` or `deliveryId`
 
@@ -179,9 +180,115 @@ network errors (timeout, connection refused, DNS failure) are the receiver
 or network failing independently of what was sent — exactly the transient
 condition retries exist for.
 
+### The retry sweeper: `FOR UPDATE SKIP LOCKED`, not ShedLock
+
+`RetrySweeper` polls `delivery WHERE status='FAILED' AND next_attempt_at <=
+now()` and republishes each to Kafka. Its query
+(`DeliveryRepository.lockDueForRetry`) ends in `FOR UPDATE SKIP LOCKED`,
+which is what makes it safe to run this on *every* dispatcher instance
+concurrently rather than needing to pick one: plain `FOR UPDATE` would make
+a second instance's query **block** until the first instance's transaction
+finishes (serializing all sweeping through one instance at a time, even
+though nothing about the work actually requires that); no locking at all
+would let two instances **both** select and republish the same row,
+double-delivering it. `SKIP LOCKED` instead makes each instance's query
+silently skip whatever rows another instance already has locked and grab
+the next ones — every instance walks away with a disjoint batch, no
+coordination required beyond what Postgres's own row locks already provide.
+A dedicated test (`RetrySweeperTest.concurrentSweepsNeverPickTheSameRow`)
+proves this directly: one transaction holds a lock on the only due row,
+and a concurrent second transaction's `lockDueForRetry` genuinely returns
+zero rows rather than blocking or double-picking.
+
+Once a batch is locked, the sweeper doesn't flip the rows to some
+in-progress status before republishing — it pushes `next_attempt_at`
+forward by a short guard window (default 120s) and commits, *then*
+publishes to Kafka outside the transaction. If the process crashes in that
+gap, nothing is lost: the row is still `FAILED`, and once the guard window
+elapses the next sweep picks it up again. The cost is a possible duplicate
+attempt in that narrow crash window, which is exactly the at-least-once
+behavior the whole system — and receivers, per RECEIVERS.md — already has
+to tolerate.
+
+This is also why the sweeper deliberately does **not** use ShedLock:
+ShedLock enforces that a job runs on exactly one instance at a time, which
+here would just throttle retry throughput to one instance's pace for no
+correctness benefit — `SKIP LOCKED` already gives every instance safe,
+independent work.
+
+### ShedLock *is* used — for the one job that actually needs single execution
+
+`PartitionMaintenanceJob` creates upcoming `delivery_attempt` partitions and
+drops ones past the retention window (the task Phase 1's schema flagged as
+"a scheduled job, out of scope for a schema migration"). Unlike the
+sweeper's row-level work, there's no natural way to split "keep the
+partition set correct" into disjoint per-instance chunks — every instance
+would try to create or drop the exact same tables at the exact same moment.
+That's what ShedLock is for: `@SchedulerLock` (backed by the `shedlock`
+table, V5 migration) guarantees only one dispatcher instance actually runs
+the job on a given schedule tick, cluster-wide.
+
+### Backoff has jitter now; the schedule is per-endpoint configurable
+
+Phase 4 shipped the bare 5s/30s/2m/10m/1h/6h/24h schedule with no jitter, as
+a placeholder — this phase replaces it. Equal jitter (`delay/2 +
+random(0, delay/2)`) is applied to whichever schedule is in effect, so
+deliveries that all failed at the same moment (one receiver-side outage
+can take down many endpoints' worth of deliveries at once) don't all retry
+in lockstep and hit the recovering receiver as a thundering herd — full
+jitter (`random(0, delay)`) was avoided because it can collapse a "wait an
+hour" step down to almost no wait at all, defeating the schedule's intent.
+`Endpoint.retryScheduleSeconds` (nullable array, V5 migration) lets a
+specific endpoint override the schedule entirely; null falls back to the
+default.
+
+### Circuit breaker and auto-pause are two tiers, not one
+
+A Resilience4j `CircuitBreaker` per endpoint (count-based sliding window
+sized to the failure threshold, 100% failure-rate trigger — which is what
+makes it "N *consecutive* failures" rather than a ratio over a longer
+history) opens after repeated failures, stops attempting for a wait period,
+then automatically lets one probe through (half-open) to check for
+recovery. That's the first line of defense, handling transient trouble — a
+deploy, a brief outage — without any human involved.
+
+Auto-pause is a deliberate escalation on top, not the same mechanism: only
+after the circuit has reopened `auto-pause-after-opens` times (default 3)
+*without ever reaching CLOSED in between* does `EndpointCircuitBreakers`
+call `EndpointPauseService` to actually pause the endpoint
+(`status=PAUSED`, `pausedReason` recorded) and stop consuming any retry
+capacity for it at all. Collapsing these into one tier — pausing
+immediately on the first open — was considered and rejected: a paused
+endpoint is skipped before the circuit breaker is ever consulted
+(`DeliveryExecutionService` checks endpoint status first), so the
+half-open probe the spec explicitly requires would never get a chance to
+matter.
+
+Known limitation: this state is in-memory, per-dispatcher-instance, not
+shared across a multi-instance deployment. Each instance independently
+decides when its view of an endpoint's circuit opens and when to escalate.
+Sharing it would need an external store (Redis); not built here.
+
+### Dead-lettering: two failure modes that redelivery can't fix
+
+`webhook.deliveries.DLT` catches two kinds of messages, both handled by one
+`DefaultErrorHandler` + `DeadLetterPublishingRecoverer` with zero consumer
+retries: malformed messages (the value doesn't deserialize —
+`ErrorHandlingDeserializer` wraps the real deserializer so this fails
+per-record instead of killing the whole consumer thread, which is what
+happens if you point `JsonDeserializer` at a Kafka listener directly with
+no wrapper) and well-formed messages whose delivery no longer exists
+(`UnprocessableDeliveryTaskException`, thrown when the endpoint or event
+behind a delivery was deleted after the message was published). Zero
+retries at this level is deliberate: an actual delivery attempt's retry
+logic already lives entirely in the `delivery` table and the sweeper — a
+message that reaches this handler failed for a reason redelivery can't
+address, because the data it points to doesn't exist or it never parsed.
+
 ## What's built so far
 
 - **Phase 1** — multi-module layout, Docker Compose (Postgres/Kafka-KRaft/Redis), Flyway schema
 - **Phase 2** — API-key (ingestion) and JWT (admin) auth, role/permission model, tenant isolation
 - **Phase 3** — `POST /api/v1/events`: validation, idempotency, fan-out, transactional outbox publish to Kafka
-- **Phase 4** — dispatcher: Stripe/Svix-style HMAC signing with secret rotation, SSRF-safe delivery on virtual threads, bounded global + per-endpoint concurrency, attempt recording, basic (Phase-5-to-be-refined) backoff scheduling
+- **Phase 4** — dispatcher: Stripe/Svix-style HMAC signing with secret rotation, SSRF-safe delivery on virtual threads, bounded global + per-endpoint concurrency, attempt recording
+- **Phase 5** — jittered, per-endpoint-configurable retry backoff; `SKIP LOCKED` retry sweeper; per-endpoint circuit breaker escalating to auto-pause; dead-letter topic; ShedLock-guarded partition maintenance

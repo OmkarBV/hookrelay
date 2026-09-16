@@ -27,10 +27,27 @@ spring:
       group-id: hookrelay-dispatcher
       auto-offset-reset: earliest
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
-      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      # Wrapped in ErrorHandlingDeserializer rather than used directly: a
+      # malformed message (JSON that doesn't match DeliveryTaskMessage)
+      # would otherwise throw during Consumer.poll() itself and kill the
+      # consumer thread, bypassing DefaultErrorHandler entirely. The wrapper
+      # catches per-record deserialization failures so they route through
+      # the same error handler as any other failure — see
+      # KafkaErrorHandlingConfig, which sends them to the dead-letter topic.
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
       properties:
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JsonDeserializer
         spring.json.trusted.packages: io.hookrelay.common.delivery
         spring.json.value.default.type: io.hookrelay.common.delivery.DeliveryTaskMessage
+    # Needed for the retry sweeper (RetrySweeper), which republishes a FAILED
+    # delivery once its nextAttemptAt has passed — the same DeliveryPublisher
+    # hookrelay-api uses for the initial publish.
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      properties:
+        acks: all
+        spring.json.add.type.headers: false
     listener:
       # One consumer thread per partition: partitioning by endpointId only
       # gives per-endpoint ordering if each partition is consumed
@@ -67,6 +84,23 @@ hookrelay:
     # one customer's endpoint.
     per-endpoint-max-concurrent: 5
     default-timeout-ms: 10000
+    sweeper:
+      interval-ms: 5000
+      batch-size: 100
+      # How far to push a locked row's next_attempt_at forward before
+      # republishing to Kafka — see RetrySweeper's Javadoc for why this,
+      # rather than a status change, is what prevents a double-pick.
+      republish-guard-seconds: 120
+    circuit-breaker:
+      failure-threshold: 5
+      wait-duration-seconds: 300
+      auto-pause-after-opens: 3
+    partition-maintenance:
+      # Cron: run once daily. ShedLock (see PartitionMaintenanceJob) ensures
+      # only one dispatcher instance actually executes it.
+      cron: "0 0 3 * * *"
+      months-ahead: 2
+      retention-months: 6
 
 management:
   endpoints:

@@ -15,6 +15,12 @@ import org.springframework.data.jpa.repository.config.EnableJpaRepositories;
  * tenant's rows by default — exactly what a background worker needs, and
  * why TenantScopedRepositoryImpl's findById fix (needed only when a filter
  * is actually enabled) doesn't apply here.
+ *
+ * <p>{@code @EnableScheduling} deliberately does not live here — see
+ * SchedulingConfig, which gates it behind a property so integration tests
+ * that construct their own Delivery/Endpoint fixtures directly can disable
+ * the retry sweeper and partition-maintenance job without them firing
+ * against a Testcontainers database that's already been torn down.
  */
 @SpringBootApplication
 @ComponentScan({"io.hookrelay.dispatcher", "io.hookrelay.common"})

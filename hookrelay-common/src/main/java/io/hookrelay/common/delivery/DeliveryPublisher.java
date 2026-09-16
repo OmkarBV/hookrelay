@@ -1,6 +1,5 @@
-package io.hookrelay.api.ingestion;
+package io.hookrelay.common.delivery;
 
-import io.hookrelay.common.delivery.DeliveryTaskMessage;
 import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -16,12 +15,18 @@ import org.springframework.stereotype.Component;
  * one endpoint's deliveries across partitions with no ordering guarantee;
  * partitioning by deliveryId (always unique) would do the same.
  *
+ * <p>Shared between hookrelay-api (the initial publish, right after
+ * ingestion commits) and hookrelay-dispatcher (the retry sweeper
+ * republishing a FAILED delivery once its nextAttemptAt has passed) —
+ * both are "make this delivery get attempted" in exactly the same shape,
+ * just triggered from different places.
+ *
  * <p>Fire-and-forget on purpose: the delivery row is already durably
- * committed by the time this is called (see EventIngestionService), so a
- * dropped or slow publish here does not lose the delivery — the Phase 5
- * retry sweeper picks up any PENDING row whose nextAttemptAt has passed
- * without a successful attempt. Blocking on the Kafka ack would only add
- * latency to the ingestion request for no correctness benefit.
+ * committed by the time this is called, so a dropped or slow publish here
+ * does not lose the delivery — the retry sweeper (or, for the very first
+ * publish, the same sweeper once nextAttemptAt passes) picks up any row
+ * whose last attempt didn't land. Blocking on the Kafka ack would only add
+ * latency for no correctness benefit.
  */
 @Component
 public class DeliveryPublisher {

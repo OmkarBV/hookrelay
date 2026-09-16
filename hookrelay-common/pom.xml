@@ -31,6 +31,13 @@
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
         </dependency>
+        <!-- DeliveryPublisher lives here so both hookrelay-api (initial
+             publish) and hookrelay-dispatcher (retry-sweeper republish) can
+             share it -->
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka</artifactId>
+        </dependency>
 
         <dependency>
             <groupId>org.springframework.boot</groupId>

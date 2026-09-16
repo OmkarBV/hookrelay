@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.hookrelay.common.application.Application;
 import io.hookrelay.common.application.ApplicationRepository;
 import io.hookrelay.common.delivery.Delivery;
+import io.hookrelay.common.delivery.DeliveryPublisher;
 import io.hookrelay.common.delivery.DeliveryRepository;
 import io.hookrelay.common.endpoint.Endpoint;
 import io.hookrelay.common.endpoint.EndpointRepository;
