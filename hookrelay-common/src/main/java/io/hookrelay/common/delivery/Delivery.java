@@ -69,6 +69,18 @@ public class Delivery {
     @Column(name = "completed_at")
     private Instant completedAt;
 
+    @Column(name = "is_replay", nullable = false)
+    private boolean replay = false;
+
+    /**
+     * Not a JPA association on purpose: a replay never needs to navigate
+     * back to the original delivery's full entity graph, only record which
+     * id it replayed, so a plain column avoids an extra fetch-join
+     * everywhere Delivery is loaded.
+     */
+    @Column(name = "replayed_from_delivery_id")
+    private UUID replayedFromDeliveryId;
+
     @Version
     @Column(name = "version", nullable = false)
     private long version;
@@ -83,6 +95,14 @@ public class Delivery {
         this.tenant = event.getTenant();
         this.createdAt = Instant.now();
         this.nextAttemptAt = this.createdAt;
+    }
+
+    /** A replay is a brand new delivery row — the original and its attempt history are never touched. */
+    public static Delivery replayOf(Delivery original) {
+        Delivery replay = new Delivery(original.event, original.endpoint);
+        replay.replay = true;
+        replay.replayedFromDeliveryId = original.id;
+        return replay;
     }
 
     public UUID getId() {
@@ -143,5 +163,13 @@ public class Delivery {
 
     public void setCompletedAt(Instant completedAt) {
         this.completedAt = completedAt;
+    }
+
+    public boolean isReplay() {
+        return replay;
+    }
+
+    public UUID getReplayedFromDeliveryId() {
+        return replayedFromDeliveryId;
     }
 }

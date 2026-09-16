@@ -285,6 +285,67 @@ logic already lives entirely in the `delivery` table and the sweeper — a
 message that reaches this handler failed for a reason redelivery can't
 address, because the data it points to doesn't exist or it never parsed.
 
+### Delivery log pagination: keyset, not offset
+
+`GET /api/v1/admin/deliveries` pages with an opaque cursor
+(`DeliveryCursor`, base64 of the last row's `createdAt` + `id`), not a page
+number. `LIMIT/OFFSET n` forces Postgres to walk and discard the first `n`
+matching rows on *every* request — page 500 of a delivery log with millions
+of rows means scanning and throwing away 500 pages' worth of index entries
+just to find where to start, and that cost grows with how deep into the
+history a page is, which is exactly where an operator investigating an
+incident is most likely to be looking (old failures, not the most recent
+page). A keyset cursor turns "skip ahead" into a plain indexed range
+condition instead — `(created_at, id) < (cursor_created_at, cursor_id)`
+(the `id` tiebreak matters whenever two rows share the same instant) — which
+costs the same O(page size) no matter how deep the page is. It also avoids
+Spring Data's `Page<T>` entirely (`findBy(spec, q -> q.limit(n).all())`
+rather than `findAll(spec, Pageable)`): a `Page` always runs a `COUNT(*)`
+query alongside the content query to report a total, which this endpoint
+has no use for and which is itself needless work on a large table. The one
+real cost of keyset pagination is that you can't jump to "page 12" directly
+— only forward from a cursor — which is a trade this delivery log doesn't
+need to make (it's investigated forward from "now" or forward from a filter,
+not paged into an arbitrary offset by number).
+
+### Replay creates a new delivery row; it never touches the original
+
+Both replay endpoints (`POST /deliveries/{id}/replay` and the bulk
+`POST /deliveries/replay`) insert a brand new `delivery` row
+(`Delivery.replayOf`) rather than resetting the original's status or
+attempt count. The original and every `delivery_attempt` row it
+accumulated stay exactly as they were — replaying is not allowed to rewrite
+history, only add a new attempt at delivering the same event. `is_replay`
+and `replayed_from_delivery_id` (V6 migration) make a replay visibly
+distinct from an original delivery in the log and traceable back to what it
+replayed.
+
+Bulk replay carries three separate guards, each defending against a
+different failure mode: **`confirm: true`** is required because an empty
+filter matches every delivery the tenant has ever had, so this stops a
+missing field or a copy-pasted request from re-queuing everything by
+accident; a **batch size cap** (default 500) rejects outright — rather than
+silently truncating — a filter that matches more than the cap, so an
+operator gets a clear "narrow your filter" error instead of quietly
+replaying only part of what they thought they were replaying; and a
+**per-tenant rate limit** (Resilience4j `RateLimiter`, default 5/minute)
+stops the endpoint itself — which can trivially re-queue hundreds of
+deliveries in one call — from becoming its own denial-of-service vector,
+independent of Phase 7's general ingestion/delivery rate limiting.
+
+### Route prefix: `/api/v1/admin/deliveries`, not the bare path
+
+The spec names the delivery log routes as `/api/v1/deliveries/...`. Every
+other admin-facing resource built so far — bootstrap, auth, applications,
+endpoints — lives under `/api/v1/admin/...`, which is exactly the path
+`SecurityConfig`'s admin `SecurityFilterChain` matches
+(`securityMatcher("/api/v1/admin/**")`). A bare `/api/v1/deliveries` path
+would match neither that chain nor the ingestion chain
+(`/api/v1/events/**`) and would fall through to the default chain's
+`denyAll()` — so these routes are kept under `/api/v1/admin` for
+consistency with the rest of the admin surface and so the existing
+authentication actually covers them.
+
 ## What's built so far
 
 - **Phase 1** — multi-module layout, Docker Compose (Postgres/Kafka-KRaft/Redis), Flyway schema
@@ -292,3 +353,4 @@ address, because the data it points to doesn't exist or it never parsed.
 - **Phase 3** — `POST /api/v1/events`: validation, idempotency, fan-out, transactional outbox publish to Kafka
 - **Phase 4** — dispatcher: Stripe/Svix-style HMAC signing with secret rotation, SSRF-safe delivery on virtual threads, bounded global + per-endpoint concurrency, attempt recording
 - **Phase 5** — jittered, per-endpoint-configurable retry backoff; `SKIP LOCKED` retry sweeper; per-endpoint circuit breaker escalating to auto-pause; dead-letter topic; ShedLock-guarded partition maintenance
+- **Phase 6** — delivery log search (keyset pagination) and detail (full attempt history), single and bulk replay with confirm/cap/rate-limit guards, original attempt history never mutated by a replay
