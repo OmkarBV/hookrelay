@@ -1,12 +1,16 @@
 package io.hookrelay.api.security;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.hookrelay.api.ingestion.IngestionRateLimitFilter;
 import io.hookrelay.api.ingestion.PayloadSizeLimitFilter;
 import io.hookrelay.api.security.apikey.ApiKeyAuthenticationFilter;
 import io.hookrelay.api.security.apikey.ApiKeyService;
 import io.hookrelay.api.security.jwt.JwtAuthenticationFilter;
 import io.hookrelay.api.security.jwt.JwtService;
 import io.hookrelay.api.security.tenant.TenantScopingFilter;
+import io.hookrelay.common.ratelimit.RedisTokenBucket;
 import jakarta.persistence.EntityManagerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.annotation.Order;
@@ -45,15 +49,24 @@ public class SecurityConfig {
     @Bean
     @Order(1)
     public SecurityFilterChain ingestionSecurityFilterChain(
-            HttpSecurity http, ApiKeyService apiKeyService, EntityManagerFactory entityManagerFactory)
+            HttpSecurity http,
+            ApiKeyService apiKeyService,
+            EntityManagerFactory entityManagerFactory,
+            RedisTokenBucket rateLimiter,
+            ObjectMapper objectMapper,
+            @Value("${hookrelay.ingestion.rate-limit.requests-per-second:50}") double requestsPerSecond,
+            @Value("${hookrelay.ingestion.rate-limit.burst-capacity:100}") double burstCapacity)
             throws Exception {
+        var apiKeyFilter = new ApiKeyAuthenticationFilter(apiKeyService);
+        var rateLimitFilter = new IngestionRateLimitFilter(rateLimiter, objectMapper, requestsPerSecond, burstCapacity);
         http.securityMatcher("/api/v1/events/**")
                 .csrf(AbstractHttpConfigurer::disable)
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(auth -> auth.anyRequest().authenticated())
                 .addFilterBefore(new PayloadSizeLimitFilter(MAX_INGESTION_BODY_BYTES), UsernamePasswordAuthenticationFilter.class)
-                .addFilterAfter(new ApiKeyAuthenticationFilter(apiKeyService), PayloadSizeLimitFilter.class)
-                .addFilterAfter(new TenantScopingFilter(entityManagerFactory), ApiKeyAuthenticationFilter.class);
+                .addFilterAfter(apiKeyFilter, PayloadSizeLimitFilter.class)
+                .addFilterAfter(rateLimitFilter, ApiKeyAuthenticationFilter.class)
+                .addFilterAfter(new TenantScopingFilter(entityManagerFactory), IngestionRateLimitFilter.class);
         return http.build();
     }
 

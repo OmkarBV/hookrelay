@@ -53,6 +53,14 @@ hookrelay:
     # deployment must override this — it decrypts every endpoint signing
     # secret in the database.
     secret-encryption-key: ${HOOKRELAY_SECRET_ENCRYPTION_KEY:2P0OfgmRP7wHAAILerwZoJCC92TIw0RjZ4l0kXhIT/k=}
+  ingestion:
+    rate-limit:
+      # Per-application ingestion cap — a token bucket in Redis, so it holds
+      # across every hookrelay-api instance, not just one. requests-per-second
+      # is the sustained rate; burst-capacity is how many requests can arrive
+      # back-to-back before the sustained rate kicks in.
+      requests-per-second: 50
+      burst-capacity: 100
 
 management:
   endpoints:

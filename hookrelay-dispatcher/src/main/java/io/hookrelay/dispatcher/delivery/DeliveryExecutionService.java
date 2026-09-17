@@ -13,6 +13,8 @@ import io.hookrelay.common.endpoint.Endpoint;
 import io.hookrelay.common.endpoint.EndpointSecret;
 import io.hookrelay.common.endpoint.EndpointSecretRepository;
 import io.hookrelay.common.endpoint.EndpointStatus;
+import io.hookrelay.common.ratelimit.RedisTokenBucket;
+import io.hookrelay.common.ratelimit.TokenBucketResult;
 import io.hookrelay.common.security.EndpointUrlValidator;
 import io.hookrelay.common.security.SsrfViolationException;
 import java.net.UnknownHostException;
@@ -62,6 +64,7 @@ public class DeliveryExecutionService {
     private final ObjectMapper objectMapper;
     private final EndpointUrlValidator endpointUrlValidator;
     private final EndpointCircuitBreakers circuitBreakers;
+    private final RedisTokenBucket rateLimiter;
 
     public DeliveryExecutionService(
             DeliveryRepository deliveryRepository,
@@ -74,7 +77,8 @@ public class DeliveryExecutionService {
             DeliveryOutcomeRecorder outcomeRecorder,
             ObjectMapper objectMapper,
             EndpointUrlValidator endpointUrlValidator,
-            EndpointCircuitBreakers circuitBreakers) {
+            EndpointCircuitBreakers circuitBreakers,
+            RedisTokenBucket rateLimiter) {
         this.deliveryRepository = deliveryRepository;
         this.endpointSecretRepository = endpointSecretRepository;
         this.secretEncryptionService = secretEncryptionService;
@@ -86,6 +90,7 @@ public class DeliveryExecutionService {
         this.objectMapper = objectMapper;
         this.endpointUrlValidator = endpointUrlValidator;
         this.circuitBreakers = circuitBreakers;
+        this.rateLimiter = rateLimiter;
     }
 
     public void execute(UUID deliveryId) {
@@ -116,6 +121,21 @@ public class DeliveryExecutionService {
             // circuit breaker has already decided is currently broken.
             recordAndTransition(delivery, null, null, null, "CIRCUIT_OPEN", true,
                     "Circuit breaker open for this endpoint");
+            return;
+        }
+
+        // Per-endpoint outbound rate limit (token bucket in Redis, shared
+        // across every dispatcher instance) — bounded to the endpoint's own
+        // configured rate_limit_per_sec so Hookrelay doesn't overwhelm a
+        // receiver that's asked to be sent to more gently, independent of
+        // whether the receiver is otherwise healthy (this is not a failure
+        // signal, so it never touches the circuit breaker).
+        TokenBucketResult rateLimit = rateLimiter.tryConsume(
+                "ratelimit:outbound:" + endpoint.getId(), endpoint.getRateLimitPerSec(), endpoint.getRateLimitPerSec(), 1);
+        if (!rateLimit.allowed()) {
+            circuitBreaker.releasePermission();
+            recordAndTransition(delivery, null, null, null, "RATE_LIMITED", true,
+                    "Per-endpoint outbound rate limit reached", Instant.now().plus(rateLimit.retryAfter()));
             return;
         }
 
@@ -219,8 +239,13 @@ public class DeliveryExecutionService {
         // 5xx, even though each individual 4xx delivery itself won't retry.
         circuitBreaker.onError(elapsedNanos, TimeUnit.NANOSECONDS, new DeliveryFailedException("HTTP " + status));
         boolean retryable = status == 429 || status >= 500;
+        // A 429 that tells us exactly when to come back is more informed
+        // than our own guess — honor it over the default backoff schedule.
+        Instant explicitNextAttemptAt = (status == 429 && result.retryAfter() != null)
+                ? Instant.now().plus(result.retryAfter())
+                : null;
         recordAndTransition(delivery, requestHeadersJson, status, result.latencyMs(),
-                retryable ? "SERVER_ERROR" : "CLIENT_ERROR", retryable, "HTTP " + status);
+                retryable ? "SERVER_ERROR" : "CLIENT_ERROR", retryable, "HTTP " + status, explicitNextAttemptAt);
     }
 
     /** Marker passed to Resilience4j's onError so its event log shows a meaningful cause. */
@@ -246,14 +271,27 @@ public class DeliveryExecutionService {
 
     /**
      * Handles both real HTTP outcomes and pre-flight failures (SSRF block,
-     * DNS failure, no secret, capacity exceeded) where no request was ever
-     * sent — {@code responseStatus} and {@code requestHeadersJson} are null
-     * in those cases, which is a truthful record of what happened, not a
-     * missing value.
+     * DNS failure, no secret, capacity exceeded, rate limited) where no
+     * request was ever sent — {@code responseStatus} and
+     * {@code requestHeadersJson} are null in those cases, which is a
+     * truthful record of what happened, not a missing value.
      */
     private void recordAndTransition(
             Delivery delivery, String requestHeadersJson, Integer responseStatus, Integer latencyMs,
             String errorType, boolean retryable, String errorMessage) {
+        recordAndTransition(delivery, requestHeadersJson, responseStatus, latencyMs, errorType, retryable, errorMessage, null);
+    }
+
+    /**
+     * @param explicitNextAttemptAt when non-null, used verbatim instead of
+     *     the RetryBackoff schedule — for a 429 whose Retry-After header
+     *     told us exactly when to come back, and for our own outbound rate
+     *     limiter's token-availability estimate, both of which are more
+     *     informed than a generic backoff guess.
+     */
+    private void recordAndTransition(
+            Delivery delivery, String requestHeadersJson, Integer responseStatus, Integer latencyMs,
+            String errorType, boolean retryable, String errorMessage, Instant explicitNextAttemptAt) {
         int attemptNumber = delivery.getAttemptCount() + 1;
         DeliveryAttempt attempt = DeliveryAttempt.failure(
                 delivery, attemptNumber, requestHeadersJson, responseStatus, null, latencyMs, errorType);
@@ -264,6 +302,9 @@ public class DeliveryExecutionService {
         if (!retryable) {
             delivery.setStatus(DeliveryStatus.EXHAUSTED);
             delivery.setCompletedAt(Instant.now());
+        } else if (explicitNextAttemptAt != null) {
+            delivery.setStatus(DeliveryStatus.FAILED);
+            delivery.setNextAttemptAt(explicitNextAttemptAt);
         } else {
             RetryBackoff.nextAttemptAt(attemptNumber, delivery.getEndpoint().getRetryScheduleSeconds()).ifPresentOrElse(
                     nextAttemptAt -> {

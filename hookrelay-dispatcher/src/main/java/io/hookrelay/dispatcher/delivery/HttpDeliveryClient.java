@@ -8,7 +8,11 @@ import java.net.http.HttpResponse;
 import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.Instant;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import org.springframework.stereotype.Component;
@@ -66,7 +70,8 @@ public class HttpDeliveryClient {
         try {
             HttpResponse<String> response = httpClient.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString());
             int latencyMs = elapsedMs(start);
-            return DeliveryHttpResult.ofResponse(response.statusCode(), truncate(response.body()), latencyMs);
+            Duration retryAfter = parseRetryAfter(response.headers().firstValue("Retry-After").orElse(null));
+            return DeliveryHttpResult.ofResponse(response.statusCode(), truncate(response.body()), latencyMs, retryAfter);
         } catch (HttpTimeoutException e) {
             return DeliveryHttpResult.ofNetworkError("TIMEOUT", elapsedMs(start));
         } catch (IOException e) {
@@ -74,6 +79,35 @@ public class HttpDeliveryClient {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return DeliveryHttpResult.ofNetworkError("INTERRUPTED", elapsedMs(start));
+        }
+    }
+
+    /**
+     * RFC 9110 allows Retry-After to be either delta-seconds ("120") or an
+     * HTTP-date ("Wed, 21 Oct 2026 07:28:00 GMT"). Both forms appear in the
+     * wild, so both are handled rather than assuming the common case.
+     */
+    private Duration parseRetryAfter(String headerValue) {
+        if (headerValue == null || headerValue.isBlank()) {
+            return null;
+        }
+        try {
+            long seconds = Long.parseLong(headerValue.trim());
+            return seconds >= 0 ? Duration.ofSeconds(seconds) : null;
+        } catch (NumberFormatException notDeltaSeconds) {
+            return Optional.ofNullable(headerValue)
+                    .map(this::parseHttpDate)
+                    .map(when -> Duration.between(Instant.now(), when))
+                    .filter(duration -> !duration.isNegative())
+                    .orElse(null);
+        }
+    }
+
+    private Instant parseHttpDate(String value) {
+        try {
+            return Instant.from(DateTimeFormatter.RFC_1123_DATE_TIME.parse(value));
+        } catch (DateTimeParseException e) {
+            return null;
         }
     }
 

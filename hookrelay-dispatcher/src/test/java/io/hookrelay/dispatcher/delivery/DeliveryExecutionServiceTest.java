@@ -40,9 +40,11 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.utility.DockerImageName;
 
 @Testcontainers
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE)
@@ -50,6 +52,10 @@ class DeliveryExecutionServiceTest {
 
     @Container
     static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>("postgres:16-alpine");
+
+    @Container
+    static final GenericContainer<?> REDIS =
+            new GenericContainer<>(DockerImageName.parse("redis:7-alpine")).withExposedPorts(6379);
 
     static WireMockServer wireMock;
 
@@ -95,6 +101,8 @@ class DeliveryExecutionServiceTest {
         // correctly blocks in production. See its Javadoc for why this
         // override exists and why it's never set outside tests.
         registry.add("hookrelay.security.ssrf-protection.enabled", () -> "false");
+        registry.add("spring.data.redis.host", REDIS::getHost);
+        registry.add("spring.data.redis.port", () -> REDIS.getMappedPort(6379));
     }
 
     @Autowired
@@ -120,16 +128,27 @@ class DeliveryExecutionServiceTest {
     }
 
     private Fixture seedDelivery(String path) {
+        return seedDelivery(path, 10);
+    }
+
+    private Fixture seedDelivery(String path, int rateLimitPerSec) {
         Tenant tenant = tenantRepository.save(new Tenant("Dispatcher Test Tenant"));
         Application application = applicationRepository.save(new Application(tenant, "Dispatcher Test App"));
-        Endpoint endpoint = endpointRepository.save(
-                new Endpoint(application, wireMock.baseUrl() + path, "test"));
+        Endpoint endpoint = new Endpoint(application, wireMock.baseUrl() + path, "test");
+        endpoint.setRateLimitPerSec(rateLimitPerSec);
+        endpoint = endpointRepository.save(endpoint);
         String rawSecret = "whsec_test_secret_value";
         endpointSecretRepository.save(new EndpointSecret(endpoint, secretEncryptionService.encrypt(rawSecret)));
         Event event = eventRepository.save(
                 new Event(application, "invoice.paid", "{\"amount\":100}", null, 20));
         Delivery delivery = deliveryRepository.save(new Delivery(event, endpoint));
         return new Fixture(delivery, rawSecret);
+    }
+
+    private Delivery anotherDeliveryForSameEndpoint(Fixture fixture) {
+        Event event = eventRepository.save(new Event(
+                fixture.delivery().getEvent().getApplication(), "invoice.paid", "{\"amount\":200}", null, 20));
+        return deliveryRepository.save(new Delivery(event, fixture.delivery().getEndpoint()));
     }
 
     @Test
@@ -186,6 +205,39 @@ class DeliveryExecutionServiceTest {
         Delivery reloaded = deliveryRepository.findById(fixture.delivery().getId()).orElseThrow();
         assertThat(reloaded.getStatus()).isEqualTo(DeliveryStatus.FAILED);
         assertThat(reloaded.getNextAttemptAt()).isNotNull();
+    }
+
+    @Test
+    void retryAfterHeaderOnA429OverridesTheDefaultBackoffSchedule() {
+        wireMock.stubFor(WireMock.post("/hook-429-retry-after")
+                .willReturn(aResponse().withStatus(429).withHeader("Retry-After", "300")));
+        Fixture fixture = seedDelivery("/hook-429-retry-after");
+
+        deliveryExecutionService.execute(fixture.delivery().getId());
+
+        Delivery reloaded = deliveryRepository.findById(fixture.delivery().getId()).orElseThrow();
+        assertThat(reloaded.getStatus()).isEqualTo(DeliveryStatus.FAILED);
+        // Default first-failure backoff (jittered 5s) would land well under
+        // a minute away; 300s only shows up here if the header was honored.
+        assertThat(reloaded.getNextAttemptAt()).isAfter(Instant.now().plusSeconds(250));
+    }
+
+    @Test
+    void outboundRateLimitThrottlesFurtherAttemptsToTheSameEndpointWithoutCallingIt() {
+        // Capacity == refill rate == 1/s: the first attempt consumes the
+        // sole token, so a second attempt made immediately after has none
+        // left and must not reach the receiver at all.
+        Fixture fixture = seedDelivery("/hook-rate-limited", 1);
+        wireMock.stubFor(WireMock.post("/hook-rate-limited").willReturn(aResponse().withStatus(200)));
+        Delivery second = anotherDeliveryForSameEndpoint(fixture);
+
+        deliveryExecutionService.execute(fixture.delivery().getId());
+        deliveryExecutionService.execute(second.getId());
+
+        assertThat(wireMock.findAll(postRequestedFor(urlEqualTo("/hook-rate-limited")))).hasSize(1);
+        Delivery reloadedSecond = deliveryRepository.findById(second.getId()).orElseThrow();
+        assertThat(reloadedSecond.getStatus()).isEqualTo(DeliveryStatus.FAILED);
+        assertThat(reloadedSecond.getLastError()).contains("rate limit");
     }
 
     @Test

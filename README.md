@@ -346,6 +346,89 @@ would match neither that chain nor the ingestion chain
 consistency with the rest of the admin surface and so the existing
 authentication actually covers them.
 
+### Rate limiting: Redis token bucket, not Resilience4j, for anything that must hold across instances
+
+Phases 4–6 already use Resilience4j (`CircuitBreaker`, `RateLimiter`) in a few
+places, but those are deliberately per-instance: a circuit breaker tracks
+*this process's* recent view of an endpoint's health, and the replay
+rate limiter only needs to stop one admin session from hammering the replay
+endpoint. Ingestion throughput limits and outbound delivery limits are a
+different kind of problem — hookrelay-api and hookrelay-dispatcher are both
+meant to run as multiple instances, and an in-memory limiter would let a
+tenant get N times their configured limit simply by spreading requests
+across N instances.
+
+`RedisTokenBucket` (`hookrelay-common`) fixes this by keeping the bucket
+state in Redis and doing the whole check-and-consume as one Lua script
+(`redis/token_bucket.lua`), so "read remaining tokens, decide, write back"
+can't race across two instances hitting the same key concurrently — a plain
+`GET`/decide/`SET` sequence would let concurrent callers both read "1 token
+left" and both consume it, leaking the bucket past its configured limit
+under load. A dedicated concurrency test
+(`RedisTokenBucketTest#isAtomicUnderConcurrentAccess`) fires 200 concurrent
+requests against a 50-token bucket from 16 threads and asserts exactly 50
+are allowed, to prove this rather than assume it.
+
+The same `RedisTokenBucket` backs two independent limits:
+
+- **Ingestion** (`IngestionRateLimitFilter`): keyed by `applicationId`, so
+  one application flooding `/api/v1/events` can't consume another
+  application's allowance even though both share the same tenant, same
+  hookrelay-api fleet, and same Redis instance.
+- **Outbound delivery** (`DeliveryExecutionService`): keyed by `endpointId`,
+  independent of and in addition to the per-endpoint circuit breaker — a
+  circuit breaker reacts to failures, but a healthy endpoint can still ask
+  to be called no faster than a configured rate, and outbound rate limiting
+  is the only one of the two mechanisms that applies to a fully successful
+  endpoint.
+
+### Honoring `Retry-After` instead of always trusting our own backoff schedule
+
+Phase 5's jittered backoff assumes hookrelay is in a better position than
+the receiver to guess when to retry. That assumption breaks the moment a
+receiver returns a `429` with an explicit `Retry-After` header — it knows
+its own recovery time better than any generic backoff curve could. RFC 9110
+allows that header to be either delta-seconds or an HTTP-date, so
+`HttpDeliveryClient.parseRetryAfter` tries the integer form first and falls
+back to `DateTimeFormatter.RFC_1123_DATE_TIME`. When present, it overrides
+`RetryBackoff.nextAttemptAt(...)` entirely for that attempt (see
+`DeliveryExecutionService.recordAndTransition`'s `explicitNextAttemptAt`
+parameter) rather than being blended with the jittered schedule — a
+receiver-supplied number is a fact, not a hint to average against.
+
+### Fairness: what's actually solved, and what isn't
+
+The spec's fairness requirement — "one application publishing 100k events
+must not starve delivery for everyone else" — is only partially solved by
+Phase 7, and it's worth being honest about the boundary rather than implying
+more than what's built.
+
+**What holds up:**
+
+- **Per-application ingestion limits** (this phase) bound how fast any one
+  application can push events into the system in the first place, which
+  bounds the worst case at the front door regardless of what happens
+  downstream.
+- **Per-endpoint outbound limits** (this phase) mean a slow or
+  rate-limit-sensitive receiver can't monopolize dispatcher HTTP capacity by
+  simply being called as fast as the dispatcher can manage.
+- **Kafka partitioning by `endpointId`** (Phase 4) means one endpoint's
+  deliveries are strictly ordered on their own partition and can't get
+  interleaved with, or block, deliveries for an unrelated endpoint on a
+  different partition.
+
+**What's still a real limitation:** partitioning is by `endpointId`, not by
+tenant or application, and the number of partitions is fixed at topic
+creation — with more endpoints than partitions, endpoints from different
+tenants can and will land on the same partition. A tenant with many
+high-volume endpoints can still cause consumer-lag for an unrelated tenant
+whose one endpoint happens to share a partition with one of the busy
+tenant's endpoints, because Kafka guarantees ordering per partition, not
+fairness across the keys sharing it. Solving that fully would mean either a
+much larger partition count with tenant-aware assignment, or a separate
+per-tenant scheduling/weighting layer above Kafka consumption — neither is
+built here, and doing so honestly is out of scope for this phase.
+
 ## What's built so far
 
 - **Phase 1** — multi-module layout, Docker Compose (Postgres/Kafka-KRaft/Redis), Flyway schema
@@ -354,3 +437,4 @@ authentication actually covers them.
 - **Phase 4** — dispatcher: Stripe/Svix-style HMAC signing with secret rotation, SSRF-safe delivery on virtual threads, bounded global + per-endpoint concurrency, attempt recording
 - **Phase 5** — jittered, per-endpoint-configurable retry backoff; `SKIP LOCKED` retry sweeper; per-endpoint circuit breaker escalating to auto-pause; dead-letter topic; ShedLock-guarded partition maintenance
 - **Phase 6** — delivery log search (keyset pagination) and detail (full attempt history), single and bulk replay with confirm/cap/rate-limit guards, original attempt history never mutated by a replay
+- **Phase 7** — Redis-backed atomic token-bucket rate limiting shared across instances, applied to both per-application ingestion and per-endpoint outbound delivery; receiver `Retry-After` overrides the default backoff schedule; documented fairness guarantees and limitations
