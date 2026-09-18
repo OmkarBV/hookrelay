@@ -40,6 +40,10 @@ curl -X POST localhost:8081/api/v1/admin/bootstrap -H 'Content-Type: application
   -d '{"tenantName":"Acme","ownerEmail":"owner@acme.example","ownerPassword":"a-strong-password"}'
 ```
 
+`docker compose up -d` also starts Prometheus (`:9090`, scraping both services'
+`/actuator/prometheus`) and Grafana (`:3000`, anonymous viewer access,
+pre-provisioned with the "Hookrelay" dashboard under `docker/grafana/`).
+
 ## Design decisions
 
 ### Tenant isolation lives in one place — and needed a second fix to actually work
@@ -429,6 +433,73 @@ much larger partition count with tenant-aware assignment, or a separate
 per-tenant scheduling/weighting layer above Kafka consumption — neither is
 built here, and doing so honestly is out of scope for this phase.
 
+### Metrics are bound at the registry a manually-built Resilience4j registry doesn't get for free
+
+`EndpointCircuitBreakers` builds its `CircuitBreakerRegistry` manually (see
+Phase 5) rather than through the Resilience4j Spring Boot starter's
+autoconfigured one, because each endpoint needs its own breaker created
+lazily on first delivery, not a fixed set of instances declared in
+`application.yml`. The cost of that choice: the starter's automatic
+Micrometer binding only wires up the registry *it* creates, so a manually
+built one is invisible to Prometheus unless bound explicitly.
+`TaggedCircuitBreakerMetrics.ofCircuitBreakerRegistry(registry).bindTo(meterRegistry)`
+does that binding and — because it subscribes to the registry's own
+entry-added event rather than snapshotting it once — keeps working as new
+per-endpoint breakers get created over the dispatcher's lifetime.
+
+### Queue lag is measured from the Kafka record timestamp, not a separately-stamped field
+
+"How long did a delivery task wait before a dispatcher instance picked it
+up" needs a timestamp for when the task became ready, but Hookrelay never
+stamps one explicitly — DeliveryPublisher's `KafkaTemplate.send(...)` already
+gets a broker-assigned record timestamp for free at produce time.
+`DeliveryTaskListener` reads that via `ConsumerRecord.timestamp()` and
+diffs it against `System.currentTimeMillis()` at the moment its
+`@KafkaListener` method runs, which needs no schema change and is accurate
+for exactly what it claims to measure: time spent sitting in the topic,
+not (say) time since the original delivery was created, which could include
+however long a FAILED delivery already spent waiting out its retry backoff
+before being republished.
+
+### Correlation id: stored on the Event, not carried in the Kafka message
+
+A correlation id has to survive from the ingestion HTTP request
+(`CorrelationIdFilter`, hookrelay-api) all the way to the dispatcher's log
+lines for every attempt at every retry of every delivery fanned out from
+that event. Rather than adding a field to `DeliveryTaskMessage` (Kafka's
+wire schema) and keeping it in sync across every republish, the id is
+stored once on the `Event` row it originated from. `DeliveryExecutionService`
+already loads `delivery.getEvent()` on every attempt (it needs the payload
+to sign and send), so reading `getCorrelationId()` from that same object and
+putting it in MDC costs nothing extra and can't drift from what ingestion
+actually recorded — including on a retry attempted an hour later by a
+completely different dispatcher instance.
+
+### Structured JSON logs: `logstash-logback-encoder`, not a custom pattern
+
+Both services log one JSON object per line (via `logback-spring.xml` +
+`LogstashEncoder`) instead of a human-formatted string, because "grep the
+logs for this request" and "let a log aggregator index by field" both need
+machine-parseable structure — a plain-text pattern layout would need a
+regex on the aggregator side to get the same thing, and would silently
+break the moment a log message's own text happened to contain something
+that regex didn't expect. `LogstashEncoder`'s default behavior already
+includes whatever is in MDC at log time (just `correlationId`, in
+practice) as a top-level JSON field with no extra configuration needed.
+
+### Health: `show-details: always`, and a hand-written Kafka indicator
+
+Spring Boot auto-configures health indicators for the `DataSource` and for
+Redis the moment their starters are on the classpath — no code needed
+there. Kafka has no such auto-configuration, so `KafkaHealthIndicator`
+(duplicated once per app rather than shared, since it's ~15 lines with no
+shared state) asks `AdminClient.describeCluster()` with a 3-second timeout
+and reports `DOWN` if that doesn't come back — the same failure mode that
+would otherwise show up only indirectly, as ingestion publish or dispatcher
+consumption quietly failing. `show-details: always` is what actually
+surfaces *which* dependency failed in the `/actuator/health` response
+rather than just an aggregate UP/DOWN with no way to tell why.
+
 ## What's built so far
 
 - **Phase 1** — multi-module layout, Docker Compose (Postgres/Kafka-KRaft/Redis), Flyway schema
@@ -438,3 +509,4 @@ built here, and doing so honestly is out of scope for this phase.
 - **Phase 5** — jittered, per-endpoint-configurable retry backoff; `SKIP LOCKED` retry sweeper; per-endpoint circuit breaker escalating to auto-pause; dead-letter topic; ShedLock-guarded partition maintenance
 - **Phase 6** — delivery log search (keyset pagination) and detail (full attempt history), single and bulk replay with confirm/cap/rate-limit guards, original attempt history never mutated by a replay
 - **Phase 7** — Redis-backed atomic token-bucket rate limiting shared across instances, applied to both per-application ingestion and per-endpoint outbound delivery; receiver `Retry-After` overrides the default backoff schedule; documented fairness guarantees and limitations
+- **Phase 8** — Micrometer metrics (deliveries by status, attempt latency histogram, queue lag, circuit breaker state, in-flight count) exported to Prometheus with a provisioned Grafana dashboard; real DB/Redis/Kafka readiness checks on `/actuator/health`; structured JSON logging with a correlation id spanning ingestion through final delivery

@@ -1,0 +1,18 @@
+# Scrapes hookrelay-api and hookrelay-dispatcher, which normally run on the
+# host (see README quick start), not inside this compose network — hence
+# host.docker.internal rather than a service name. Requires the
+# extra_hosts entry in docker-compose.yml on Linux, where that hostname
+# isn't available by default the way it is on Docker Desktop.
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: hookrelay-api
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["host.docker.internal:8081"]
+
+  - job_name: hookrelay-dispatcher
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["host.docker.internal:8082"]

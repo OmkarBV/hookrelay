@@ -58,11 +58,21 @@ public class Event {
     @Column(name = "payload_size_bytes", nullable = false, updatable = false)
     private int payloadSizeBytes;
 
+    @Column(name = "correlation_id", nullable = false, updatable = false)
+    private String correlationId;
+
     protected Event() {
         // JPA
     }
 
+    /** Generates its own correlation id — for callers with no request-scoped one to thread through (mainly tests). */
     public Event(Application application, String eventType, String payload, String idempotencyKey, int payloadSizeBytes) {
+        this(application, eventType, payload, idempotencyKey, payloadSizeBytes, UUID.randomUUID().toString());
+    }
+
+    public Event(
+            Application application, String eventType, String payload, String idempotencyKey,
+            int payloadSizeBytes, String correlationId) {
         this.application = application;
         this.tenant = application.getTenant();
         this.eventType = eventType;
@@ -70,6 +80,7 @@ public class Event {
         this.idempotencyKey = idempotencyKey;
         this.receivedAt = Instant.now();
         this.payloadSizeBytes = payloadSizeBytes;
+        this.correlationId = correlationId;
     }
 
     public UUID getId() {
@@ -102,5 +113,9 @@ public class Event {
 
     public int getPayloadSizeBytes() {
         return payloadSizeBytes;
+    }
+
+    public String getCorrelationId() {
+        return correlationId;
     }
 }

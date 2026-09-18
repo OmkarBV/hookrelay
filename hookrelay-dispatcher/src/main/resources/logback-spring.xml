@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  One line of JSON per log event, including whatever is currently in MDC
+  ("correlationId", set by DeliveryExecutionService from the delivery's
+  originating Event) so a delivery's logs can be tied back to the ingestion
+  request that caused it without a log aggregator needing to parse a
+  human-formatted message first.
+-->
+<configuration>
+    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <fieldNames>
+                <version>[ignore]</version>
+            </fieldNames>
+        </encoder>
+    </appender>
+
+    <root level="INFO">
+        <appender-ref ref="STDOUT"/>
+    </root>
+</configuration>

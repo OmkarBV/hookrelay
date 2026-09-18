@@ -17,6 +17,7 @@ import io.hookrelay.common.ratelimit.RedisTokenBucket;
 import io.hookrelay.common.ratelimit.TokenBucketResult;
 import io.hookrelay.common.security.EndpointUrlValidator;
 import io.hookrelay.common.security.SsrfViolationException;
+import io.hookrelay.dispatcher.observability.DeliveryMetrics;
 import java.net.UnknownHostException;
 import java.time.Instant;
 import java.util.LinkedHashMap;
@@ -27,6 +28,7 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import org.springframework.stereotype.Service;
 
 /**
@@ -65,6 +67,7 @@ public class DeliveryExecutionService {
     private final EndpointUrlValidator endpointUrlValidator;
     private final EndpointCircuitBreakers circuitBreakers;
     private final RedisTokenBucket rateLimiter;
+    private final DeliveryMetrics metrics;
 
     public DeliveryExecutionService(
             DeliveryRepository deliveryRepository,
@@ -78,7 +81,8 @@ public class DeliveryExecutionService {
             ObjectMapper objectMapper,
             EndpointUrlValidator endpointUrlValidator,
             EndpointCircuitBreakers circuitBreakers,
-            RedisTokenBucket rateLimiter) {
+            RedisTokenBucket rateLimiter,
+            DeliveryMetrics metrics) {
         this.deliveryRepository = deliveryRepository;
         this.endpointSecretRepository = endpointSecretRepository;
         this.secretEncryptionService = secretEncryptionService;
@@ -91,6 +95,7 @@ public class DeliveryExecutionService {
         this.endpointUrlValidator = endpointUrlValidator;
         this.circuitBreakers = circuitBreakers;
         this.rateLimiter = rateLimiter;
+        this.metrics = metrics;
     }
 
     public void execute(UUID deliveryId) {
@@ -115,6 +120,18 @@ public class DeliveryExecutionService {
             return;
         }
 
+        // Every log line for this delivery attempt is tied back to the
+        // ingestion request that originated it (see CorrelationIdFilter in
+        // hookrelay-api) via the id stored on its Event.
+        MDC.put("correlationId", delivery.getEvent().getCorrelationId());
+        try {
+            executeWithCorrelationId(delivery, endpoint);
+        } finally {
+            MDC.remove("correlationId");
+        }
+    }
+
+    private void executeWithCorrelationId(Delivery delivery, Endpoint endpoint) {
         CircuitBreaker circuitBreaker = circuitBreakers.forEndpoint(endpoint.getId());
         if (!circuitBreaker.tryAcquirePermission()) {
             // Don't waste a semaphore/bulkhead slot on an endpoint the
@@ -181,7 +198,12 @@ public class DeliveryExecutionService {
                 return;
             }
 
-            attemptDelivery(delivery, endpoint, signingSecrets, circuitBreaker);
+            metrics.incrementInFlight();
+            try {
+                attemptDelivery(delivery, endpoint, signingSecrets, circuitBreaker);
+            } finally {
+                metrics.decrementInFlight();
+            }
         } catch (InterruptedException e) {
             circuitBreaker.releasePermission();
             Thread.currentThread().interrupt();

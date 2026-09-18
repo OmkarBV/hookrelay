@@ -3,6 +3,8 @@ package io.hookrelay.dispatcher.delivery;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
+import io.github.resilience4j.micrometer.tagged.TaggedCircuitBreakerMetrics;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.time.Duration;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -49,6 +51,7 @@ public class EndpointCircuitBreakers {
 
     public EndpointCircuitBreakers(
             EndpointPauseService pauseService,
+            MeterRegistry meterRegistry,
             @Value("${hookrelay.dispatcher.circuit-breaker.failure-threshold:5}") int failureThreshold,
             @Value("${hookrelay.dispatcher.circuit-breaker.wait-duration-seconds:300}") long waitDurationSeconds,
             @Value("${hookrelay.dispatcher.circuit-breaker.auto-pause-after-opens:3}") int autoPauseAfterOpens) {
@@ -65,6 +68,15 @@ public class EndpointCircuitBreakers {
                 .automaticTransitionFromOpenToHalfOpenEnabled(true)
                 .build();
         this.registry = CircuitBreakerRegistry.of(config);
+
+        // This registry is built manually (not via the Resilience4j Spring
+        // Boot starter's autoconfigured one), so its metrics aren't bound to
+        // Micrometer automatically the way application.yml-declared
+        // instances would be — this does that binding explicitly. It
+        // subscribes to the registry's own entry-added/removed events, so
+        // per-endpoint breakers created later (the common case, since these
+        // are created lazily on first delivery) are picked up too.
+        TaggedCircuitBreakerMetrics.ofCircuitBreakerRegistry(this.registry).bindTo(meterRegistry);
 
         // Fires exactly once per endpoint, at first-creation time — the
         // right place to wire a per-breaker listener without re-registering

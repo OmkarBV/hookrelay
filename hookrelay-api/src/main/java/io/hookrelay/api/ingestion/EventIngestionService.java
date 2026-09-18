@@ -12,9 +12,11 @@ import io.hookrelay.common.endpoint.EndpointRepository;
 import io.hookrelay.common.endpoint.EndpointStatus;
 import io.hookrelay.common.event.Event;
 import io.hookrelay.common.event.EventRepository;
+import io.hookrelay.api.observability.CorrelationIdFilter;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.UUID;
+import org.slf4j.MDC;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -123,8 +125,12 @@ public class EventIngestionService {
         Application application = applicationRepository.findById(applicationId)
                 .orElseThrow(() -> new IllegalArgumentException("Application not found: " + applicationId));
 
+        String correlationId = MDC.get(CorrelationIdFilter.MDC_KEY);
+        if (correlationId == null) {
+            correlationId = UUID.randomUUID().toString();
+        }
         Event event = eventRepository.saveAndFlush(
-                new Event(application, eventType, payloadJson, idempotencyKey, payloadSizeBytes));
+                new Event(application, eventType, payloadJson, idempotencyKey, payloadSizeBytes, correlationId));
 
         List<Endpoint> subscribedEndpoints =
                 endpointRepository.findSubscribed(applicationId, EndpointStatus.ACTIVE, eventType);

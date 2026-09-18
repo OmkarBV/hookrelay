@@ -4,6 +4,9 @@ import io.hookrelay.common.delivery.Delivery;
 import io.hookrelay.common.delivery.DeliveryAttempt;
 import io.hookrelay.common.delivery.DeliveryAttemptRepository;
 import io.hookrelay.common.delivery.DeliveryRepository;
+import io.hookrelay.dispatcher.observability.DeliveryMetrics;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -19,18 +22,32 @@ import org.springframework.transaction.annotation.Transactional;
 @Service
 public class DeliveryOutcomeRecorder {
 
+    private static final Logger log = LoggerFactory.getLogger(DeliveryOutcomeRecorder.class);
+
     private final DeliveryRepository deliveryRepository;
     private final DeliveryAttemptRepository deliveryAttemptRepository;
+    private final DeliveryMetrics metrics;
 
     public DeliveryOutcomeRecorder(
-            DeliveryRepository deliveryRepository, DeliveryAttemptRepository deliveryAttemptRepository) {
+            DeliveryRepository deliveryRepository, DeliveryAttemptRepository deliveryAttemptRepository,
+            DeliveryMetrics metrics) {
         this.deliveryRepository = deliveryRepository;
         this.deliveryAttemptRepository = deliveryAttemptRepository;
+        this.metrics = metrics;
     }
 
     @Transactional
     public void record(Delivery delivery, DeliveryAttempt attempt) {
         deliveryAttemptRepository.save(attempt);
         deliveryRepository.save(delivery);
+        metrics.recordAttempt(delivery.getStatus(), attempt.getErrorType(), attempt.getLatencyMs());
+        // The one log line every delivery attempt is guaranteed to produce,
+        // successful or not — with MDC's correlationId (set by
+        // DeliveryExecutionService around this call), it's what makes "find
+        // every log line for this request, from ingestion through final
+        // delivery" actually possible instead of only true for the
+        // exceptional paths that already logged something.
+        log.info("Delivery {} attempt #{} to endpoint {}: {}", delivery.getId(), attempt.getAttemptNumber(),
+                delivery.getEndpoint().getId(), attempt.getErrorType() == null ? "SUCCESS" : attempt.getErrorType());
     }
 }

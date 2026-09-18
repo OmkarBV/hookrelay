@@ -37,6 +37,7 @@
         <testcontainers.version>1.21.4</testcontainers.version>
         <wiremock.version>3.9.1</wiremock.version>
         <jjwt.version>0.12.6</jjwt.version>
+        <logstash-logback-encoder.version>8.0</logstash-logback-encoder.version>
     </properties>
 
     <dependencyManagement>

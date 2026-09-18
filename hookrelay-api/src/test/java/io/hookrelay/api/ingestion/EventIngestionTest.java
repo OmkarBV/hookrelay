@@ -147,6 +147,23 @@ class EventIngestionTest {
     }
 
     @Test
+    void correlationIdIsEchoedBackAndGeneratedWhenNotSupplied() {
+        endpointRepository.save(subscribed(application, "invoice.paid", EndpointStatus.ACTIVE));
+        Map<String, Object> body = Map.of("eventType", "invoice.paid", "payload", Map.of("amount", 100));
+
+        ResponseEntity<Map> generated = restTemplate.postForEntity(
+                "/api/v1/events", requestWithKey(body, null), Map.class);
+        assertThat(generated.getHeaders().getFirst("X-Correlation-Id")).isNotBlank();
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.setBearerAuth(rawApiKey);
+        headers.add("X-Correlation-Id", "caller-supplied-id-123");
+        ResponseEntity<Map> echoed = restTemplate.postForEntity(
+                "/api/v1/events", new HttpEntity<>(body, headers), Map.class);
+        assertThat(echoed.getHeaders().getFirst("X-Correlation-Id")).isEqualTo("caller-supplied-id-123");
+    }
+
+    @Test
     void rejectsMalformedEventType() {
         Map<String, Object> body = Map.of("eventType", "not-namespaced", "payload", Map.of("x", 1));
         ResponseEntity<Map> response = restTemplate.postForEntity(

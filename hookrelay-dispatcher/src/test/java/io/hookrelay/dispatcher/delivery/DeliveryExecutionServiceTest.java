@@ -255,6 +255,53 @@ class DeliveryExecutionServiceTest {
         assertThat(attempts.get(0).getAttemptNumber()).isEqualTo(1);
     }
 
+    @Autowired
+    private io.micrometer.core.instrument.MeterRegistry meterRegistry;
+
+    @Test
+    void successfulDeliveryIncrementsTheStatusCounterAndRecordsLatencyAndLeavesInFlightAtZero() {
+        wireMock.stubFor(WireMock.post("/hook-metrics").willReturn(aResponse().withStatus(200)));
+        Fixture fixture = seedDelivery("/hook-metrics");
+
+        double before = meterRegistry.get("hookrelay.deliveries.total")
+                .tag("status", "SUCCEEDED").tag("error_type", "none").counter().count();
+
+        deliveryExecutionService.execute(fixture.delivery().getId());
+
+        double after = meterRegistry.get("hookrelay.deliveries.total")
+                .tag("status", "SUCCEEDED").tag("error_type", "none").counter().count();
+        assertThat(after).isEqualTo(before + 1);
+        assertThat(meterRegistry.get("hookrelay.delivery.attempt.latency").tag("status", "SUCCEEDED")
+                .timer().count()).isGreaterThan(0);
+        assertThat(meterRegistry.get("hookrelay.delivery.inflight").gauge().value()).isEqualTo(0.0);
+    }
+
+    @Test
+    void correlationIdIsSetDuringExecutionAndClearedAfterward() {
+        wireMock.stubFor(WireMock.post("/hook-correlation").willReturn(aResponse().withStatus(200)));
+        Fixture fixture = seedDelivery("/hook-correlation");
+        assertThat(fixture.delivery().getEvent().getCorrelationId()).isNotBlank();
+
+        deliveryExecutionService.execute(fixture.delivery().getId());
+
+        assertThat(org.slf4j.MDC.get("correlationId")).isNull();
+    }
+
+    @Test
+    void failedDeliveryIsCountedUnderItsErrorType() {
+        wireMock.stubFor(WireMock.post("/hook-metrics-fail").willReturn(aResponse().withStatus(500)));
+        Fixture fixture = seedDelivery("/hook-metrics-fail");
+
+        double before = meterRegistry.get("hookrelay.deliveries.total")
+                .tag("status", "FAILED").tag("error_type", "SERVER_ERROR").counter().count();
+
+        deliveryExecutionService.execute(fixture.delivery().getId());
+
+        double after = meterRegistry.get("hookrelay.deliveries.total")
+                .tag("status", "FAILED").tag("error_type", "SERVER_ERROR").counter().count();
+        assertThat(after).isEqualTo(before + 1);
+    }
+
     private boolean verifySignature(String rawBody, String signatureHeader, String secret) throws Exception {
         String[] parts = signatureHeader.split(",");
         long timestamp = Long.parseLong(parts[0].substring("t=".length()));
